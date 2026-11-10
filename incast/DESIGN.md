@@ -120,6 +120,38 @@ Fully eliminating the drops would require either:
 both of which are larger redesigns. The current window + short-RTO design
 already turns near-zero scores into 50-83 across the scenarios.
 
+### Attempted: rank-based admission control (reverted)
+
+To attack I2 specifically, a scheduling scheme was implemented and then
+reverted:
+
+- **Idea.** When the fan-in is so large that even one packet per worker exceeds
+  the pipe, admit only the first K flows (by `lab_host_rank()`) to send at a
+  real window and **pause the rest at a zero advertised window**. As admitted
+  flows finish and call `lab_host_leave()`, the paused flows' rank drops into
+  the admitted set (FIFO), so they resume. K was estimated from the BDP.
+- **Result.** It worked dramatically for I2 (**~40 -> ~82**, drops 216 -> 18)
+  and was a no-op for small fan-ins.
+- **Why reverted.** The zero-window hold introduced a **zero-window deadlock**:
+  a paused sender can only resume when it receives a window-update ACK, but a
+  pure window update is not retransmitted, and with nothing in flight the
+  sender's retransmission timer never fires -- so a single lost wakeup ACK
+  parks that flow forever. This showed up as intermittent (then, with a
+  periodic re-advertise, consistent) **0.0 scores on I1/I2/I3** ("the
+  receiver's last ACK advertised a window of 0 bytes and no window update
+  followed: a zero-window deadlock"). Three receiver-side wakeup mechanisms
+  were tried (ACK on active-set change; periodic re-advertise; re-advertise
+  gated on `lab_host_remaining`) and each still deadlocked.
+- **What it would need.** A correct version requires proper **sender-side
+  zero-window probing** (the paused sender periodically probes to elicit a
+  fresh window), which is self-healing against lost ACKs. That is a sizeable,
+  risky change to the core send loop (which currently deliberately avoids
+  injecting probes) and could destabilise the already-strong I1/I3 and the
+  Bufferbloat folder, so it was judged not worth the risk for one test's gain.
+
+The shipped design therefore keeps the robust window + short-RTO approach, with
+I2 left at ~40-48.
+
 ---
 
 ## 5. File / function index

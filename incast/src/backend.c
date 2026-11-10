@@ -89,6 +89,7 @@ static uint16_t compute_adv_window(cmu_socket_t *sock) {
     if (fair_window > abs_cap) {
       fair_window = abs_cap;
     }
+
     if ((int)fair_window < free_space) {
       free_space = (int)fair_window;
     }
