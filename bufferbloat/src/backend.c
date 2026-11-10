@@ -653,16 +653,48 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
           remove_acked_packets(sock, ack);
 
           // --- Vegas RTT sampling. If the timed segment is now acknowledged,
-          // record one RTT sample and update the minimum (base) RTT.
+          // record one RTT sample and maintain a WINDOWED minimum base RTT.
           if (sock->rtt_pending && !after(sock->rtt_seq, ack)) {
-            uint64_t sample = now_us() - sock->rtt_send_ms;  // microseconds
+            uint64_t now = now_us();
+            uint64_t sample = now - sock->rtt_send_ms;  // microseconds
             if (sample == 0) {
               sample = 1;  // clamp to avoid divide-by-zero
             }
             sock->rtt_sample_ms = (uint32_t)sample;
-            if (sample < sock->base_rtt_ms) {
-              sock->base_rtt_ms = (uint32_t)sample;
+
+            // Track the minimum within the current observation window.
+            if ((uint32_t)sample < sock->win_min_us) {
+              sock->win_min_us = (uint32_t)sample;
             }
+
+            if (!sock->vegas_inited) {
+              // First sample: seed everything.
+              sock->base_rtt_ms = (uint32_t)sample;
+              sock->base_rtt_stamp_us = now;
+              sock->win_min_us = (uint32_t)sample;
+              sock->win_start_us = now;
+            } else if ((uint32_t)sample < sock->base_rtt_ms) {
+              // base_rtt can DROP immediately (we just saw an emptier queue).
+              sock->base_rtt_ms = (uint32_t)sample;
+              sock->base_rtt_stamp_us = now;
+            } else {
+              // base_rtt can only RISE after a full window confirms the old
+              // minimum is stale. The window is ~10 base RTTs (bounded), long
+              // enough to ignore transient queueing but short enough to notice
+              // a real propagation-delay increase within a handful of RTTs.
+              uint64_t win_len = (uint64_t)sock->base_rtt_ms * 5ULL;
+              if (win_len < 30000ULL) win_len = 30000ULL;      // >= 30 ms
+              if (win_len > 200000ULL) win_len = 200000ULL;    // <= 200 ms
+              if (now - sock->win_start_us >= win_len) {
+                // Adopt the window's minimum as the new base (it may be larger
+                // than the old base: that is the delay-increase case).
+                sock->base_rtt_ms = sock->win_min_us;
+                sock->base_rtt_stamp_us = now;
+                sock->win_min_us = (uint32_t)sample;  // restart window
+                sock->win_start_us = now;
+              }
+            }
+
             sock->rtt_pending = 0;
             sock->vegas_inited = 1;
           }

@@ -145,6 +145,15 @@ typedef struct {
   // has completed and the Vegas control law runs once.
   uint32_t round_end_seq;
   int vegas_inited;       // 1 once base_rtt has a real sample.
+  // base_rtt windowing: base_rtt must be able to RISE when the path's
+  // propagation delay genuinely increases (e.g. a route change), not stay
+  // pinned to an old minimum forever (which would make every later RTT look
+  // like a huge queue and collapse cwnd). We keep the minimum over a recent
+  // time window: base_rtt_stamp_us is when the current base was observed, and
+  // win_min_us is the smallest sample seen in the window currently filling.
+  uint64_t base_rtt_stamp_us;  // time the current base_rtt was recorded
+  uint32_t win_min_us;         // min RTT seen in the current window
+  uint64_t win_start_us;       // start of the current window
 } cmu_socket_t;
 
 /*

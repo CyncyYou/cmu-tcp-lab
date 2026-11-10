@@ -94,6 +94,9 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->rtt_send_ms = 0;
   sock->round_end_seq = isn;
   sock->vegas_inited = 0;
+  sock->base_rtt_stamp_us = 0;
+  sock->win_min_us = UINT32_MAX;
+  sock->win_start_us = 0;
 
   if (pthread_cond_init(&sock->wait_cond, NULL) != 0) {
     perror("ERROR condition variable not set\n");
