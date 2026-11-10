@@ -30,6 +30,18 @@
 #include "cmu_tcp.h"
 
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
+#define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
+
+// --- TCP Vegas tuning (delay-based congestion control) ---------------------
+// Vegas keeps the estimated number of queued bytes (diff) in [ALPHA, BETA].
+// Below ALPHA the path is under-utilised, so cwnd grows; above BETA the queue
+// is building, so cwnd shrinks; in between it holds. GAMMA governs the slow
+// -start -> congestion-avoidance transition. Values are in bytes, expressed as
+// small multiples of MSS. With the local test's BDP (~7 MSS), holding ~2-4 MSS
+// of queue keeps the bottleneck busy without filling the 30-packet buffer.
+#define VEGAS_ALPHA ((uint32_t)MSS / 2u)
+#define VEGAS_BETA (1u * (uint32_t)MSS)
+#define VEGAS_GAMMA (1u * (uint32_t)MSS)
 
 /**
  * Computes the advertised window to report to the peer: the amount of free
@@ -261,6 +273,94 @@ static uint64_t now_ms(void) {
 }
 
 /**
+ * Returns the current monotonic time in microseconds. Used for Vegas RTT
+ * sampling: at a 20 ms RTT, millisecond resolution is too coarse to detect a
+ * 1-2 packet standing queue (which adds only a few hundred microseconds to a
+ * few milliseconds), so RTT and base RTT are tracked in microseconds.
+ */
+static uint64_t now_us(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
+static void log_cwnd(cmu_socket_t *sock);  // forward declaration
+/**
+ * TCP Vegas per-round congestion-window update. Called once per RTT, after a
+ * fresh RTT sample (sock->rtt_sample_ms) and base RTT (sock->base_rtt_ms) are
+ * available. Assumes the caller holds window_lock.
+ * Vegas estimates the number of bytes queued at the bottleneck as
+ *
+ *   diff = (expected_throughput - actual_throughput) * base_rtt
+ *        = cwnd - cwnd * base_rtt / rtt
+ *        = cwnd * (rtt - base_rtt) / rtt
+ *
+ * and steers cwnd so diff stays in [ALPHA, BETA]: grow when the queue is too
+ * small (link under-used), shrink when it is too large (queue building toward
+ * overflow), hold otherwise. In slow start it doubles cwnd each round until
+ * diff exceeds GAMMA, then switches to the linear congestion-avoidance regime.
+ */
+static void vegas_update(cmu_socket_t *sock) {
+  uint32_t rtt = sock->rtt_sample_ms;
+  uint32_t base = sock->base_rtt_ms;
+  if (rtt == 0 || base == 0 || base == UINT32_MAX) {
+    return;  // not enough information yet
+  }
+
+  // Estimated queued bytes. Guard against rtt < base (clock jitter) -> 0.
+  uint32_t diff = 0;
+  if (rtt > base) {
+    diff = (uint32_t)(((uint64_t)sock->cwnd * (rtt - base)) / rtt);
+  }
+
+  if (sock->cc_state == CC_SLOW_START) {
+    if (diff > VEGAS_GAMMA) {
+      // Too much queue to keep doubling: enter congestion avoidance and pull
+      // cwnd back to the target occupancy.
+      sock->cc_state = CC_CONGESTION_AVOIDANCE;
+      if (sock->cwnd > diff) {
+        sock->cwnd -= (diff - VEGAS_ALPHA > 0 ? (diff - VEGAS_ALPHA) : 0);
+      }
+    } else {
+      // Exponential growth, one MSS per ACKed segment this round (~doubling),
+      // but capped so a single round cannot overshoot wildly.
+      sock->cwnd += MSS;
+    }
+  } else {  // CC_CONGESTION_AVOIDANCE (and treat FAST_RECOVERY like CA here)
+    sock->cc_state = CC_CONGESTION_AVOIDANCE;
+    // Proportional convergence instead of a fixed +/- MSS step. We want the
+    // estimated queue (diff) to equal a small target (~1 packet). The queue
+    // error is (diff - target); correcting cwnd by a damped fraction of that
+    // error drives the operating point toward the target without the limit
+    // -cycle overshoot that a full-MSS step per round produces. This keeps the
+    // standing queue near one packet, minimising the game flow's added delay
+    // while leaving just enough in flight to keep the link busy.
+    int32_t target = (int32_t)((uint32_t)MSS / 2u);  // desired queue occupancy
+    int32_t err = (int32_t)diff - target;         // >0: too much queue
+    int32_t step = err / 4;                       // gentle gain -> less ringing
+    if (step == 0) {
+      step = (err > 0) ? 1 : (err < 0 ? -1 : 0);  // always nudge toward target
+    }
+    // Clamp the per-round change so a single noisy sample cannot swing cwnd far
+    // and set up a large oscillation (the limit cycle that spikes p95 lag).
+    int32_t cap = (int32_t)((uint32_t)MSS / 2u);
+    if (step > cap) step = cap;
+    if (step < -cap) step = -cap;
+    int32_t new_cwnd = (int32_t)sock->cwnd - step;
+    if (new_cwnd < (int32_t)MSS) {
+      new_cwnd = (int32_t)MSS;
+    }
+    sock->cwnd = (uint32_t)new_cwnd;
+  }
+
+  // Never let cwnd fall below one segment.
+  if (sock->cwnd < (uint32_t)MSS) {
+    sock->cwnd = (uint32_t)MSS;
+  }
+  log_cwnd(sock);
+}
+
+/**
  * (Re)starts the retransmission timer. Assumes the caller holds window_lock.
  */
 static void timer_start(cmu_socket_t *sock) {
@@ -350,6 +450,9 @@ static void on_dup_ack(cmu_socket_t *sock) {
     sock->ssthresh = sock->cwnd / 2;
     sock->cwnd = sock->ssthresh + 3 * MSS;
     retransmit_missing_segment(sock);
+    // Karn's algorithm: do not measure RTT across a retransmission. Discard any
+    // in-flight Vegas RTT sample so the next fresh segment restarts timing.
+    sock->rtt_pending = 0;
     sock->dup_ack_count = 0;
     sock->cc_state = CC_FAST_RECOVERY;
     log_cwnd(sock);
@@ -376,6 +479,11 @@ static void on_timeout(cmu_socket_t *sock) {
   // Whole-window retransmit recovers multi-segment loss so transfers complete.
   retransmit_packets(sock);
   sock->cc_state = CC_SLOW_START;
+  // Karn's algorithm: a retransmission makes the outstanding RTT sample
+  // ambiguous, so discard it. Restart the Vegas round boundary at the current
+  // send sequence so the control law resumes cleanly once ACKs return.
+  sock->rtt_pending = 0;
+  sock->round_end_seq = sock->window.next_seq_to_send;
   // Restart the timer so a lost retransmission triggers another timeout.
   timer_start(sock);
   log_cwnd(sock);
@@ -543,7 +651,31 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
           // New ACK, slide window forward and drive congestion control.
           sock->window.last_ack_received = ack;
           remove_acked_packets(sock, ack);
-          on_new_ack(sock);
+
+          // --- Vegas RTT sampling. If the timed segment is now acknowledged,
+          // record one RTT sample and update the minimum (base) RTT.
+          if (sock->rtt_pending && !after(sock->rtt_seq, ack)) {
+            uint64_t sample = now_us() - sock->rtt_send_ms;  // microseconds
+            if (sample == 0) {
+              sample = 1;  // clamp to avoid divide-by-zero
+            }
+            sock->rtt_sample_ms = (uint32_t)sample;
+            if (sample < sock->base_rtt_ms) {
+              sock->base_rtt_ms = (uint32_t)sample;
+            }
+            sock->rtt_pending = 0;
+            sock->vegas_inited = 1;
+          }
+
+          // --- Vegas per-round control. Run the cwnd update once per RTT:
+          // when this ACK passes the sequence that ended the previous round.
+          if (sock->vegas_inited && !after(sock->round_end_seq, ack)) {
+            vegas_update(sock);
+            // The next round covers everything currently in flight.
+            sock->round_end_seq = sock->window.next_seq_to_send;
+          }
+          sock->dup_ack_count = 0;
+
           // Restart the retransmission timer for the next-oldest outstanding
           // segment, or stop it if everything is acknowledged.
           if (sock->packet_buffer_head != NULL) {
@@ -833,6 +965,15 @@ void single_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
     add_packet_to_buffer(sock, msg, plen, seq);
 
     sock->window.next_seq_to_send += payload_len;
+    // Vegas RTT sampling: if no segment is currently being timed, time this
+    // one. We record its END sequence number so the sample completes when a
+    // cumulative ACK first covers the whole segment. One sample per RTT is
+    // enough for the per-round control law.
+    if (!sock->rtt_pending) {
+      sock->rtt_pending = 1;
+      sock->rtt_seq = sock->window.next_seq_to_send;  // end seq of this segment
+      sock->rtt_send_ms = now_us();  // stored in microseconds
+    }
     // Sending new data marks forward progress, so any prior run of duplicate
     // ACKs is no longer a loss signal for the current flight. Reset the
     // duplicate counter so stale/early duplicate ACKs cannot spuriously
@@ -852,6 +993,36 @@ void single_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
 
     // Check for ACKs while sending
     check_for_data(sock, NO_WAIT);
+
+    // --- Pacing. Spread this window's packets evenly across the RTT instead of
+    // releasing them as one burst. A burst of a whole window (~BDP worth of
+    // packets) transiently fills the bottleneck queue even when the average
+    // rate is correct, which is exactly what inflates the game flow's p95
+    // latency. Pacing holds the instantaneous queue near the Vegas target.
+    //
+    // Inter-packet gap = time to drain one segment at the path rate
+    //   = base_rtt / (cwnd / MSS) = base_rtt_us * MSS / cwnd  (microseconds).
+    // Pacing off base_rtt (the empty-queue propagation time) spreads each
+    // window across one RTT, smoothing the burst that would otherwise spike the
+    // bottleneck queue. The 7/8 factor leaves headroom so pacing never becomes
+    // the bottleneck and goodput stays at the link rate.
+    pthread_mutex_lock(&(sock->window_lock));
+    uint32_t pace_cwnd = sock->cwnd;
+    uint32_t pace_base_us = sock->base_rtt_ms;  // stored in microseconds
+    pthread_mutex_unlock(&(sock->window_lock));
+    if (pace_base_us != UINT32_MAX && pace_cwnd > (uint32_t)MSS) {
+      uint64_t gap_us = (uint64_t)pace_base_us * (uint32_t)MSS / pace_cwnd;
+      gap_us = gap_us * 7 / 8;        // leave headroom so the link stays full
+      if (gap_us > 5000) {
+        gap_us = 5000;                // never stall more than 5 ms per packet
+      }
+      if (gap_us > 0) {
+        struct timespec ts;
+        ts.tv_sec = (time_t)(gap_us / 1000000ULL);
+        ts.tv_nsec = (long)((gap_us % 1000000ULL) * 1000ULL);
+        nanosleep(&ts, NULL);
+      }
+    }
   }
 
   // Wait for all packets to be acknowledged. Only retransmit on a genuine

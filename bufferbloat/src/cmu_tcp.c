@@ -84,6 +84,17 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->timer_running = 0;
   sock->timer_start_ms = 0;
 
+  // TCP Vegas (delay-based) initial state. base_rtt starts at "unknown"
+  // (UINT32_MAX) so the first sample becomes the minimum. No RTT sample is
+  // outstanding yet, and the first round boundary is the initial send seq.
+  sock->base_rtt_ms = UINT32_MAX;
+  sock->rtt_sample_ms = 0;
+  sock->rtt_pending = 0;
+  sock->rtt_seq = 0;
+  sock->rtt_send_ms = 0;
+  sock->round_end_seq = isn;
+  sock->vegas_inited = 0;
+
   if (pthread_cond_init(&sock->wait_cond, NULL) != 0) {
     perror("ERROR condition variable not set\n");
     return EXIT_ERROR;

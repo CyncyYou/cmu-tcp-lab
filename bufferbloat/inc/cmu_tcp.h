@@ -126,6 +126,25 @@ typedef struct {
   // since timer_start_ms reaches DEFAULT_TIMEOUT, independent of dup ACKs.
   int timer_running;
   uint64_t timer_start_ms;
+  // --- TCP Vegas (delay-based) congestion control. Protected by window_lock.
+  // Vegas keeps the bottleneck queue short by reacting to RTT inflation rather
+  // than waiting for loss, which both lowers latency (good for the game flow in
+  // Bufferbloat) and avoids the loss-driven cwnd collapse that wastes goodput.
+  //
+  // RTT is sampled once per round trip: when no sample is outstanding, the next
+  // segment sent is "timed" by recording its end sequence number (rtt_seq) and
+  // send time (rtt_send_ms). When a cumulative ACK first covers rtt_seq, the
+  // elapsed time is one RTT sample.
+  uint32_t base_rtt_ms;   // Minimum RTT ever seen (empty-queue propagation).
+  uint32_t rtt_sample_ms; // Most recent RTT sample.
+  int rtt_pending;        // 1 while a timed segment is outstanding.
+  uint32_t rtt_seq;       // End sequence number of the timed segment.
+  uint64_t rtt_send_ms;   // Time the timed segment was sent (CLOCK_MONOTONIC).
+  // Vegas updates cwnd once per RTT. round_end_seq marks the send-sequence
+  // boundary of the current round; when last_ack_received passes it, a round
+  // has completed and the Vegas control law runs once.
+  uint32_t round_end_seq;
+  int vegas_inited;       // 1 once base_rtt has a real sample.
 } cmu_socket_t;
 
 /*
