@@ -154,6 +154,7 @@ typedef struct {
   uint64_t base_rtt_stamp_us;  // time the current base_rtt was recorded
   uint32_t win_min_us;         // min RTT seen in the current window
   uint64_t win_start_us;       // start of the current window
+  int overload_count;          // consecutive rounds with a badly overgrown queue
 } cmu_socket_t;
 
 /*

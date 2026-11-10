@@ -328,21 +328,18 @@ static void vegas_update(cmu_socket_t *sock) {
     }
   } else {  // CC_CONGESTION_AVOIDANCE (and treat FAST_RECOVERY like CA here)
     sock->cc_state = CC_CONGESTION_AVOIDANCE;
-    // Proportional convergence instead of a fixed +/- MSS step. We want the
-    // estimated queue (diff) to equal a small target (~1 packet). The queue
-    // error is (diff - target); correcting cwnd by a damped fraction of that
-    // error drives the operating point toward the target without the limit
-    // -cycle overshoot that a full-MSS step per round produces. This keeps the
-    // standing queue near one packet, minimising the game flow's added delay
-    // while leaving just enough in flight to keep the link busy.
+    // Proportional convergence: steer the estimated queue (diff) toward a small
+    // target (~1 packet) by a damped, clamped step. The damping avoids the
+    // limit cycle that a full-MSS step per round would create (which spikes the
+    // game flow's p95 latency), while still keeping the standing queue short.
     int32_t target = (int32_t)((uint32_t)MSS / 2u);  // desired queue occupancy
     int32_t err = (int32_t)diff - target;         // >0: too much queue
-    int32_t step = err / 4;                       // gentle gain -> less ringing
+    int32_t step = err / 4;                        // gentle gain -> less ringing
     if (step == 0) {
-      step = (err > 0) ? 1 : (err < 0 ? -1 : 0);  // always nudge toward target
+      step = (err > 0) ? 1 : (err < 0 ? -1 : 0);   // always nudge toward target
     }
     // Clamp the per-round change so a single noisy sample cannot swing cwnd far
-    // and set up a large oscillation (the limit cycle that spikes p95 lag).
+    // and set up a large oscillation.
     int32_t cap = (int32_t)((uint32_t)MSS / 2u);
     if (step > cap) step = cap;
     if (step < -cap) step = -cap;

@@ -28,13 +28,29 @@
 
 #include "cmu_packet.h"
 #include "cmu_tcp.h"
+#include "lab_host.h"
 
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
+#define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
 
 /**
- * Computes the advertised window to report to the peer: the amount of free
- * space remaining in the receive buffer. This is MAX_NETWORK_BUFFER minus the
- * bytes currently buffered but not yet consumed by the application.
+ * Computes the advertised window to report to the peer.
+ *
+ * Incast design: the aggregator runs one receiving (TCP_LISTENER) process per
+ * worker, and all of them share host information through lab_host. Many workers
+ * answer at the same instant through a small switch buffer; if each sender is
+ * allowed a large window, their COMBINED in-flight data overruns the buffer,
+ * packets are dropped, and senders stall on long retransmission timeouts.
+ *
+ * To prevent that, each receiver advertises only its FAIR SHARE of the pipe:
+ *
+ *   fair_window = (bandwidth-delay product) / (number of active connections)
+ *
+ * so the sum over all N workers is about one BDP -- the link stays full with a
+ * near-empty queue and no drops. We never advertise more than the free space
+ * actually left in this receiver's buffer, and never less than one MSS so every
+ * flow keeps making progress. On a sending (worker) socket lab_host returns 0,
+ * so we fall back to plain free-space flow control.
  *
  * Caller may hold recv_lock; this only reads received_len.
  */
@@ -47,6 +63,37 @@ static uint16_t compute_adv_window(cmu_socket_t *sock) {
   if (free_space > MAX_NETWORK_BUFFER) {
     free_space = MAX_NETWORK_BUFFER;
   }
+
+  // Fair-share cap (receiver side only; 0 on a worker's sending socket).
+  double link_bps = lab_host_link_bps();
+  uint32_t base_rtt_us = lab_host_base_rtt_us();
+  int n = lab_host_active();
+  if (link_bps > 0 && base_rtt_us > 0 && n > 0) {
+    // BDP in bytes = link_bps/8 * base_rtt_us/1e6.
+    double bdp = link_bps / 8.0 * (double)base_rtt_us / 1e6;
+    // Allow a little headroom (1.25x BDP total) so the link never goes idle
+    // between rounds, then split equally among the active connections.
+    double fair = (bdp * 1.25) / (double)n;
+    uint32_t fair_window = (uint32_t)fair;
+    if (fair_window < (uint32_t)MSS) {
+      fair_window = (uint32_t)MSS;  // at least one segment per flow
+    }
+    // Absolute cap: early in the query, lab_host_active() is small (not every
+    // worker has connected yet), so BDP/n would grant the first few flows a
+    // large share. If many flows each grab that share before the rest arrive,
+    // their combined first flights overflow the switch -- the classic incast
+    // collapse. Capping each flow to a couple of segments keeps the aggregate
+    // bounded no matter how many have joined so far; once all N are active the
+    // BDP/n term is the tighter limit anyway.
+    uint32_t abs_cap = 2u * (uint32_t)MSS;
+    if (fair_window > abs_cap) {
+      fair_window = abs_cap;
+    }
+    if ((int)fair_window < free_space) {
+      free_space = (int)fair_window;
+    }
+  }
+
   return (uint16_t)free_space;
 }
 
@@ -274,14 +321,37 @@ static void timer_start(cmu_socket_t *sock) {
 static void timer_stop(cmu_socket_t *sock) { sock->timer_running = 0; }
 
 /**
- * Returns 1 if the retransmission timer is running and has expired (elapsed
- * >= DEFAULT_TIMEOUT). Assumes the caller holds window_lock.
+ * Returns 1 if the retransmission timer is running and has expired.
+ *
+ * Incast design: the fixed 3-second DEFAULT_TIMEOUT is catastrophic here. When
+ * many workers overflow the switch at the same instant, a dropped packet that
+ * waits 3 s to be resent dominates the whole query's completion time (the
+ * baseline finishes in multiples of 3 s for exactly this reason). Instead we
+ * use a short, RTT-based timeout: a few times the empty-queue base RTT (from
+ * lab_host), bounded to a sane range. This recovers lost packets in tens of
+ * milliseconds rather than seconds. Assumes the caller holds window_lock.
  */
 static int timer_expired(cmu_socket_t *sock) {
   if (!sock->timer_running) {
     return 0;
   }
-  return (now_ms() - sock->timer_start_ms) >= (uint64_t)DEFAULT_TIMEOUT;
+  uint32_t base_us = lab_host_base_rtt_us();
+  uint64_t rto_ms;
+  if (base_us > 0) {
+    rto_ms = (uint64_t)base_us * 4 / 1000;  // ~4 x base RTT
+    if (rto_ms < 20) rto_ms = 20;           // floor: 20 ms
+    if (rto_ms > 200) rto_ms = 200;         // cap: 200 ms
+  } else {
+    rto_ms = 100;  // no host info (e.g. worker before Go): conservative default
+  }
+  // Per-flow jitter (0..31 ms, deterministic from the local port). When many
+  // workers lose packets in the same instant, a fixed RTO makes them all
+  // retransmit together and re-overflow the switch -- a synchronized
+  // retransmission storm. Spreading each flow's timeout by a different amount
+  // de-synchronizes the resends so they do not collide again.
+  uint64_t jitter = (uint64_t)(sock->my_port & 0x1F);
+  rto_ms += jitter;
+  return (now_ms() - sock->timer_start_ms) >= rto_ms;
 }
 
 /**
@@ -503,6 +573,15 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
           sock->window.next_seq_expected = seq + 1;
           sock->window.last_ack_received = ack;
 
+          // Incast: capture the receiver's advertised window from the SYN-ACK
+          // right away. Without this the worker would keep the initial
+          // MAX_NETWORK_BUFFER assumption and blast an uncontrolled first
+          // flight -- and with many workers starting at once, those first
+          // flights together overflow the switch buffer and cause the drops we
+          // are trying to avoid. Honouring the fair-share window from the very
+          // first data segment keeps the synchronized startup within the pipe.
+          sock->window.adv_window_from_receiver = get_advertised_window(hdr);
+
           // Remove SYN from buffer
           remove_acked_packets(sock, ack);
 
@@ -648,8 +727,11 @@ void check_for_data(cmu_socket_t *sock, cmu_read_mode_t flags) {
       struct pollfd ack_fd;
       ack_fd.fd = sock->socket;
       ack_fd.events = POLLIN;
-      // Timeout after DEFAULT_TIMEOUT.
-      if (poll(&ack_fd, 1, DEFAULT_TIMEOUT) <= 0) {
+      // Incast: block only briefly (not the 3 s DEFAULT_TIMEOUT) so the caller
+      // wakes often enough to honour the short RTT-based retransmission timeout.
+      // A lost packet is then resent in tens of ms, not seconds. Any arriving
+      // ACK wakes poll immediately, so this adds no latency on the fast path.
+      if (poll(&ack_fd, 1, 10 /* ms */) <= 0) {
         break;
       }
     }
